@@ -35,12 +35,25 @@ local LP = Players.LocalPlayer
 local IS_PC = UserInputService.KeyboardEnabled and UserInputService.MouseEnabled
 local IS_TOUCH_ONLY = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
--- 执行器原生的鼠标左键（有就优先用，比 VirtualInputManager 稳）
-local nativeClick = rawget(getfenv(0), "mouse1click")
-local nativePress = rawget(getfenv(0), "keypress")
-local nativeRelease = rawget(getfenv(0), "keyrelease")
+-- 执行器 API 探测：不同执行器（YuB-X / Delta / Wave / Fluxus…）暴露位置不一样，
+-- 只认 rawget(getfenv(0), …) 会在部分执行器上全部拿到 nil。
+local function api(name)
+    local ok, v = pcall(function() return getfenv(0)[name] end)
+    if ok and v ~= nil then return v end
+    ok, v = pcall(function() return getgenv()[name] end)
+    if ok and v ~= nil then return v end
+    ok, v = pcall(function() return _G[name] end)
+    if ok and v ~= nil then return v end
+    ok, v = pcall(function() return rawget(_G, name) end)
+    if ok and v ~= nil then return v end
+    return nil
+end
 
-local rawGetConnections = rawget(getfenv(0), "getconnections")
+local nativeClick = api("mouse1click")
+local nativePress = api("keypress")
+local nativeRelease = api("keyrelease")
+
+local rawGetConnections = api("getconnections")
 
 local function safeGetConnections(signal)
     if not rawGetConnections then return nil end
@@ -1184,7 +1197,7 @@ local gui = new("ScreenGui", {
 -- 关键：protect_gui 必须在设置 Parent 之前调用。
 -- 作用：让这个 ScreenGui 不出现在 PlayerGui/CoreGui 的子级列表里，
 --       游戏自己的 LocalScript 遍历 PlayerGui 时扫不到它。
-local protectGui = rawget(getfenv(0), "protect_gui") or (syn and syn.protect_gui)
+local protectGui = api("protect_gui") or (syn and syn.protect_gui)
 if protectGui then pcall(protectGui, gui) end
 gui.Parent = parentGui
 gui:SetAttribute("GKH", true)
