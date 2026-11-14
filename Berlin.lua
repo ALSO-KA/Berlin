@@ -358,6 +358,12 @@ local function startFly()
         bv.Velocity = Vector3.zero
         bv.Parent = root
         flyBV = bv
+    else
+        -- 冲量模式：起飞先给一脚，脱离地面摩擦后再交给每帧控制
+        if hum.FloorMaterial ~= Enum.Material.Air then
+            local m = root.AssemblyMass or 1
+            root:ApplyImpulse(Vector3.new(0, 26 * m, 0))
+        end
     end
 
     local cur = Vector3.zero
@@ -1558,9 +1564,12 @@ makeLabel(r2b, "飞行高度", "相对起飞点，越低越安全")
 makeSlider(r2b, 10, 200, CFG.flyMaxHeight, 5, "格", function(v) CFG.flyMaxHeight = v end)
 
 local r2c = makeRow(secMove)
-makeLabel(r2c, "飞行引擎", "冲量=不留 BodyVelocity 实例")
+makeLabel(r2c, "飞行引擎", "BV 会在角色里留实例，必被踢")
 makeSelector(r2c, function() return CFG.flyEngine end, { "冲量", "BV" }, function(v)
     CFG.flyEngine = v
+    if v == "BV" then
+        statusLabel.Text = "警告：BV 引擎会在角色里生成 BodyVelocity，这个游戏会立刻踢"
+    end
     if CFG.fly then startFly() end
 end)
 
