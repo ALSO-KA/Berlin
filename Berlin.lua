@@ -167,7 +167,8 @@ local PROFILES = {
 
 local CFG = {
     -- 机动
-    fly = false, flySpeed = 55, flyLift = 0, flyForward = false, flyMode = "标准",
+    fly = false, flySpeed = 45, flyLift = 0, flyForward = false, flyMode = "隐", flyMaxHeight = 25,
+    flyEngine = "冲量",
     speedOn = false, speedMul = 1.8,
 
     -- 战斗
@@ -335,17 +336,29 @@ local function startFly()
 
     stopFly()
 
-    local stealthMode = (CFG.flyMode == "隐")
-    if not stealthMode then
+    -- 【反检测核心】只有「标准」模式才碰 PlatformStand。
+    -- 这个属性会被复制到服务端，是最容易被 kick 的特征，默认不再使用。
+    local hardMode = (CFG.flyMode == "标准")
+    if hardMode then
         hum.PlatformStand = true
     end
 
-    local bv = Instance.new("BodyVelocity")
-    bv.Name = "Fly"          -- 中性名字，不用特征名
-    bv.MaxForce = Vector3.new(1, 1, 1) * 1e6
-    bv.Velocity = Vector3.zero
-    bv.Parent = root
-    flyBV = bv
+    -- 以起飞点为基准，限制相对高度（绝对高度检测是最常见的服务端检测点）
+    local groundY = root.Position.Y
+
+    -- 【引擎选择】冲量模式不在角色里创建任何实例。
+    -- 游戏脚本遍历 Character 找 BodyVelocity/BodyGyro 是经典检测手段，
+    -- 用 ApplyImpulse 就没有可扫的东西。
+    local useImpulse = (CFG.flyEngine ~= "BV")
+    local bv
+    if not useImpulse then
+        bv = Instance.new("BodyVelocity")
+        bv.Name = "BodyVelocity"   -- 用引擎默认名，不留自定义特征
+        bv.MaxForce = Vector3.new(1, 1, 1) * 1e6
+        bv.Velocity = Vector3.zero
+        bv.Parent = root
+        flyBV = bv
+    end
 
     local cur = Vector3.zero
 
@@ -354,7 +367,8 @@ local function startFly()
         if not c then return end
         local r = c:FindFirstChild("HumanoidRootPart")
         local h = c:FindFirstChildOfClass("Humanoid")
-        if not (r and h and bv and bv.Parent) then return end
+        if not (r and h) then return end
+        if bv and not bv.Parent then return end
 
         local dir = h.MoveDirection
         if CFG.flyForward then
@@ -370,29 +384,48 @@ local function startFly()
 
         local p = prof()
         local spd = math.min(CFG.flySpeed, p.maxFly)
-        if CFG.stealth then spd = math.min(spd, 35) end
-        if CFG.watched then spd = math.min(spd, 22) end
 
-        -- 人类化：速度微波动，不是恒定值
+        -- 隐模式硬上限：水平 28、垂直缓升，尽量贴近"正常移动"的量级
+        if not hardMode then
+            spd = math.min(spd, 28)
+        end
+        if CFG.stealth then spd = math.min(spd, 22) end
+        if CFG.watched then spd = math.min(spd, 16) end
+
         if CFG.humanize then
             spd = spd * (0.97 + math.sin(os.clock() * 3.1) * 0.03)
         end
 
+        -- 高度天花板
+        local ceiling = groundY + CFG.flyMaxHeight
+        if hardMode then
+            ceiling = math.min(ceiling, p.maxHeight)
+        end
+
         local lift = CFG.flyLift * spd * 0.7
-        if stealthMode then
-            lift = math.max(lift, 2.5)   -- 低可观测模式：靠轻微上升脱离地面
+        if not hardMode then
+            -- 不设 PlatformStand 时靠小幅上推离地，不猛冲
+            lift = math.max(lift, 1.4)
+        end
+        if r.Position.Y > ceiling then
+            lift = math.min(lift, -3)
         end
 
         local target = dir * spd + Vector3.new(0, lift, 0)
 
         -- 平滑加速，避免速度瞬间跳变（速度突变是最明显的特征之一）
-        cur = cur:Lerp(target, math.clamp(dt * 8, 0, 1))
-        bv.Velocity = cur
+        cur = cur:Lerp(target, math.clamp(dt * 6, 0, 1))
 
-        -- 高度上限
-        local maxH = math.min(p.maxHeight, CFG.stealth and 55 or p.maxHeight)
-        if r.Position.Y > maxH then
-            bv.Velocity = Vector3.new(bv.Velocity.X, math.min(bv.Velocity.Y, -4), bv.Velocity.Z)
+        if bv then
+            bv.Velocity = cur
+        else
+            -- 冲量模式：把当前速度拉向目标速度，角色里不生成任何实例
+            local vel = r.AssemblyLinearVelocity
+            local delta = cur - vel
+            local mass = r.AssemblyMass
+            if mass and mass > 0 then
+                r:ApplyImpulse(delta * mass)
+            end
         end
     end)
 end
@@ -1031,7 +1064,14 @@ local gui = new("ScreenGui", {
     IgnoreGuiInset = true,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
     DisplayOrder = 999,
-}, parentGui)
+})
+
+-- 关键：protect_gui 必须在设置 Parent 之前调用。
+-- 作用：让这个 ScreenGui 不出现在 PlayerGui/CoreGui 的子级列表里，
+--       游戏自己的 LocalScript 遍历 PlayerGui 时扫不到它。
+local protectGui = rawget(getfenv(0), "protect_gui") or (syn and syn.protect_gui)
+if protectGui then pcall(protectGui, gui) end
+gui.Parent = parentGui
 gui:SetAttribute("GKH", true)
 
 local overlay = new("Frame", {
@@ -1504,14 +1544,28 @@ makeToggle(r1, function() return CFG.fly end, function(v)
 end)
 
 local r2 = makeRow(secMove)
-makeLabel(r2, "飞行模式", "标准 / 隐（低可观测）")
-makeSelector(r2, function() return CFG.flyMode end, { "标准", "隐" }, function(v)
+makeLabel(r2, "飞行模式", "隐 = 不碰 PlatformStand")
+makeSelector(r2, function() return CFG.flyMode end, { "隐", "标准" }, function(v)
     CFG.flyMode = v
+    if v == "标准" then
+        statusLabel.Text = "警告：标准模式会设 PlatformStand，容易被服务端 kick"
+    end
+    if CFG.fly then startFly() end
+end)
+
+local r2b = makeRow(secMove)
+makeLabel(r2b, "飞行高度", "相对起飞点，越低越安全")
+makeSlider(r2b, 10, 200, CFG.flyMaxHeight, 5, "格", function(v) CFG.flyMaxHeight = v end)
+
+local r2c = makeRow(secMove)
+makeLabel(r2c, "飞行引擎", "冲量=不留 BodyVelocity 实例")
+makeSelector(r2c, function() return CFG.flyEngine end, { "冲量", "BV" }, function(v)
+    CFG.flyEngine = v
     if CFG.fly then startFly() end
 end)
 
 local r3 = makeRow(secMove)
-makeLabel(r3, "飞行速度", "上限受安全档位限制")
+makeLabel(r3, "飞行速度", "隐模式硬上限 28")
 makeSlider(r3, 20, 200, CFG.flySpeed, 1, "", function(v) CFG.flySpeed = v end)
 
 local r4 = makeRow(secMove)
