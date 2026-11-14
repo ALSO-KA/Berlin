@@ -191,6 +191,12 @@ local CFG = {
     -- 机动
     fly = false, flySpeed = 45, flyLift = 0, flyForward = false, flyMode = "隐", flyMaxHeight = 25,
     flyEngine = "冲量",
+
+    -- Gakuran 实际键位（左下角 UI 显示）
+    keyAttack = "g",
+    keyHeavy  = "r",
+    keyBlock  = "f",
+    keyDodge  = "q",
     speedOn = false, speedMul = 1.8,
 
     -- 战斗
@@ -224,13 +230,56 @@ end
 -- 前向声明（Lua 词法作用域：必须在使用它的函数定义之前声明）
 local refreshers = {}
 local selectorRefreshers = {}
-local statusLabel, ball, doPanic
+local statusLabel, ball, doPanic, closePanel, openPanel, panel
 
 --------------------------------------------------------------
 -- 4. 输入模拟
 --------------------------------------------------------------
+-- Gakuran 键位（游戏左下角显示）：G 轻攻击 / R 重攻击 / F 格挡 / Q 闪避
+-- 用字符串按键名，比 Enum.KeyCode 更通用（执行器 keypress 吃字符串）
+local function tapKey(name, holdSec)
+    name = tostring(name or ""):lower()
+    if name == "" then return end
+    local hold = holdSec or 0.06
+    local kc = Enum.KeyCode[name:upper()]
+
+    -- 优先 VirtualInputManager：直接注入 Roblox 输入管线，不吃窗口焦点
+    if kc then
+        local ok1 = pcall(function()
+            VirtualInputManager:SendKeyEvent(true, kc, false, game)
+        end)
+        if ok1 then
+            task.delay(hold, function()
+                pcall(function()
+                    VirtualInputManager:SendKeyEvent(false, kc, false, game)
+                end)
+            end)
+            return true
+        end
+    end
+
+    -- 备选：执行器原生 keypress（系统级，需要游戏窗口有焦点）
+    if nativePress then
+        local okPress = pcall(nativePress, name)
+        if not okPress then okPress = pcall(nativePress, name:upper()) end
+        if okPress then
+            task.delay(hold, function()
+                if nativeRelease then
+                    pcall(nativeRelease, name)
+                    pcall(nativeRelease, name:upper())
+                end
+            end)
+            return true
+        end
+    end
+    return false
+end
+
 local function pressKey(k, holdSec)
-    -- 执行器原生 keypress 优先，其次 VirtualInputManager
+    if type(k) == "string" then
+        return tapKey(k, holdSec)
+    end
+    -- 兼容旧的 Enum.KeyCode 调用
     if nativePress and IS_PC then
         local name = k.Name
         if pcall(nativePress, name) then
@@ -255,13 +304,8 @@ local function clickCenter()
     if not cam then return end
     local vp = cam.ViewportSize
 
-    -- PC：原生 mouse1click 最稳
-    if IS_PC and nativeClick then
-        if pcall(nativeClick) then return end
-    end
-
-    -- 点击位置做 ±8% 抖动，避免每次都是固定点
-    -- PC 上取偏上区域（40%），避开底部的血条/快捷栏 UI
+    -- 一律走 VirtualInputManager：它注入的是 Roblox 输入管线，
+    -- 执行器窗口挡在前面也能进游戏；native mouse1click 会被窗口焦点吃掉。
     local jx = (math.random() - 0.5) * 0.16
     local jy = (math.random() - 0.5) * 0.16
     local x = vp.X * (0.5 + jx)
@@ -378,23 +422,21 @@ end
 
 local function actionBlock()
     if IS_PC then
-        -- PC：游戏读的是键盘 F，直接按，按钮只做补充
-        pressKey(Enum.KeyCode.F)
+        tapKey(CFG.keyBlock, 0.09)
         local btns = findButtons(KEY_BLOCK, 1, true)
         if #btns > 0 then fireButton(btns[1]) end
         return true
     end
-    -- 手机：按钮优先，再兜位置，最后按 F
     local btns = findButtons(KEY_BLOCK, 2, true)
     if #btns == 0 then btns = findFallbackButtons() end
     if #btns > 0 then fireButton(btns[1]) end
-    pressKey(Enum.KeyCode.F)
+    tapKey(CFG.keyBlock, 0.09)
     return #btns > 0
 end
 
 local function actionDodge()
     if IS_PC then
-        pressKey(Enum.KeyCode.Q)
+        tapKey(CFG.keyDodge, 0.06)
         local btns = findButtons(KEY_DODGE, 1, true)
         if #btns > 0 then fireButton(btns[1]) end
         return true
@@ -402,7 +444,7 @@ local function actionDodge()
     local btns = findButtons(KEY_DODGE, 2, true)
     if #btns == 0 then btns = findFallbackButtons() end
     if #btns > 0 then fireButton(btns[1]) end
-    pressKey(Enum.KeyCode.Q)
+    tapKey(CFG.keyDodge, 0.06)
     return #btns > 0
 end
 
@@ -945,13 +987,17 @@ local function doAttack()
     atkState.last = now
     STAT.atk = STAT.atk + 1
 
+    -- 人类化连招：每 4 次轻击接一次重击 R
+    if CFG.humanize and STAT.atk % 4 == 0 and CFG.atkMode == "自动" then
+        tapKey(CFG.keyHeavy, 0.06)
+        return
+    end
+
     if CFG.atkMode == "鼠标" then
         clickCenter()
     elseif CFG.atkMode == "Remote" then
         if not fireRemoteAttack() then
-            local btns = findButtons(KEY_ATTACK, 2, true)
-            if #btns == 0 then btns = findFallbackButtons() end
-            if #btns > 0 then fireButton(btns[1]) else clickCenter() end
+            tapKey(CFG.keyAttack, 0.05)
         end
     elseif CFG.atkMode == "按钮" then
         local btns = findButtons(KEY_ATTACK, 2, true)
@@ -959,16 +1005,13 @@ local function doAttack()
         if #btns > 0 then
             fireButton(btns[1])
             STAT.btnHit = STAT.btnHit + 1
+        else
+            tapKey(CFG.keyAttack, 0.05)
         end
     else
-        -- 自动：PC 用鼠标左键（游戏本来就是左键出拳），手机找屏幕按钮
+        -- 自动：PC 上就是鼠标左键（已实测 VirtualInputManager 注入有效）
         if IS_PC then
             clickCenter()
-            local btns = findButtons(KEY_ATTACK, 1, true)
-            if #btns > 0 then
-                fireButton(btns[1])
-                STAT.btnHit = STAT.btnHit + 1
-            end
         else
             local btns = findButtons(KEY_ATTACK, 2, true)
             if #btns == 0 then btns = findFallbackButtons() end
@@ -976,7 +1019,7 @@ local function doAttack()
                 fireButton(btns[1])
                 STAT.btnHit = STAT.btnHit + 1
             else
-                clickCenter()
+                tapKey(CFG.keyAttack, 0.05)
             end
         end
     end
@@ -1217,7 +1260,7 @@ local VP0 = (CAM0 and CAM0.ViewportSize) or Vector2.new(1280, 720)
 local PANEL_W = math.min(IS_PC and 560 or VP0.X * 0.92, VP0.X * 0.95)
 local PANEL_H = math.min(IS_PC and 780 or VP0.Y * 0.84, VP0.Y * 0.92)
 
-local panel = new("Frame", {
+panel = new("Frame", {
     Size = UDim2.fromOffset(PANEL_W, PANEL_H),
     Position = UDim2.fromScale(0.5, 0.5),
     AnchorPoint = Vector2.new(0.5, 0.5),
@@ -1764,6 +1807,9 @@ local f1 = makeRow(secFight)
 makeLabel(f1, "智能防御", "Parry / 格挡 / 闪避")
 makeToggle(f1, function() return CFG.defense end, function(v) CFG.defense = v end)
 
+local f0 = makeRow(secFight)
+makeLabel(f0, "游戏键位", "G 轻击 · R 重击 · F 格挡 · Q 闪避")
+
 local f2 = makeRow(secFight)
 makeLabel(f2, "防御策略", "智能 / 只格挡 / 只闪避")
 makeSelector(f2, function() return CFG.defMode end, { "智能", "只格挡", "只闪避" }, function(v) CFG.defMode = v end)
@@ -1782,7 +1828,11 @@ makeSlider(f5, 0, 0.30, CFG.defLead, 0.01, "s", function(v) CFG.defLead = v end)
 
 local f6 = makeRow(secFight)
 makeLabel(f6, "自动战斗", "OFF / NPC / PVP")
-makeSelector(f6, function() return CFG.combat end, { "OFF", "NPC", "PVP" }, function(v) CFG.combat = v end)
+makeSelector(f6, function() return CFG.combat end, { "OFF", "NPC", "PVP" }, function(v)
+    CFG.combat = v
+    -- 面板居中会挡住模拟点击落点，开打时自动收起
+    if v ~= "OFF" and closePanel then pcall(closePanel) end
+end)
 
 local f7 = makeRow(secFight)
 makeLabel(f7, "手动锁定", "锁最近目标优先攻击")
@@ -1935,7 +1985,7 @@ end)
 --------------------------------------------------------------
 -- 14. 面板开关
 --------------------------------------------------------------
-local function openPanel()
+openPanel = function()
     overlay.Visible = true
     panel.Visible = true
     if ball then ball.Visible = false end
@@ -1943,7 +1993,7 @@ local function openPanel()
     tween(panel, 0.2, { Size = UDim2.fromOffset(PANEL_W, PANEL_H) })
 end
 
-local function closePanel()
+closePanel = function()
     overlay.Visible = false
     panel.Visible = false
     if ball then ball.Visible = true end
