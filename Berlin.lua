@@ -320,12 +320,12 @@ local function clickCenter()
     end)
 end
 
-local buttonCache, buttonCacheTime = {}, 0
+local buttonCache, buttonCacheTime = {}, {}
 
 local function findButtons(keys, maxCount, useCache)
     local now = os.clock()
     local key = table.concat(keys, "|")
-    if useCache and buttonCache[key] and now - buttonCacheTime < 2 then
+    if useCache and buttonCache[key] and now - (buttonCacheTime[key] or 0) < 2 then
         local out = {}
         for _, b in ipairs(buttonCache[key]) do
             if b and b.Parent and b.Visible then table.insert(out, b) end
@@ -345,7 +345,7 @@ local function findButtons(keys, maxCount, useCache)
         end
     end
     buttonCache[key] = out
-    buttonCacheTime = now
+    buttonCacheTime[key] = now
     return out
 end
 
@@ -602,6 +602,7 @@ end)
 -- 6. 无限体力（带随机波动的软锁）
 --------------------------------------------------------------
 local staminaTargets = {}
+local staminaLastScan = 0
 local STAM_KEYS = { "posture", "stamina", "energy", "endurance", "guard", "poise", "体力", "气力" }
 
 local function scanStamina(scene)
@@ -649,6 +650,15 @@ local function rescanStamina()
 end
 
 local function lockStamina()
+    -- 目标为空时定期重扫：开局还没加载完就打开开关，字段会一直是 0
+    if #staminaTargets == 0 then
+        local now = os.clock()
+        if not staminaLastScan or now - staminaLastScan > 3 then
+            staminaLastScan = now
+            pcall(rescanStamina)
+        end
+    end
+
     -- 不锁死 100%，在 90–100% 间波动，避免"恒定满值"这种异常特征
     local jitter = 0.90 + math.random() * 0.10
     for i = #staminaTargets, 1, -1 do
@@ -1100,15 +1110,20 @@ local function updateCombat()
     local flat = Vector3.new(tPos.X, myPos.Y, tPos.Z)
     local dist = (flat - myPos).Magnitude
 
-    if dist > 0.6 then
+    -- 只在近身时才强制转向：每帧无条件写 CFrame 会跟物理抢，容易被位置校验抓到
+    if dist < 10 and dist > 0.6 then
         if not combatRotating then
             hum.AutoRotate = false
             combatRotating = true
         end
         me.CFrame = CFrame.lookAt(myPos, flat)
+    elseif combatRotating and dist >= 10 then
+        hum.AutoRotate = true
+        combatRotating = false
     end
 
-    if dist > 6.5 then
+    -- Gakuran 的 M1 有效距离大约 5 格，往前贴到 4.5 再打，比站远处空挥强
+    if dist > 4.5 then
         local dir = flat - myPos
         if dir.Magnitude > 0.1 then hum:Move(dir.Unit, false) end
     else
