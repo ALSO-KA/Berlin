@@ -31,6 +31,15 @@ local ReplicatedStorage   = game:GetService("ReplicatedStorage")
 
 local LP = Players.LocalPlayer
 
+-- 平台判定：PC 端走键鼠，手机端走屏幕按钮
+local IS_PC = UserInputService.KeyboardEnabled and UserInputService.MouseEnabled
+local IS_TOUCH_ONLY = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+-- 执行器原生的鼠标左键（有就优先用，比 VirtualInputManager 稳）
+local nativeClick = rawget(getfenv(0), "mouse1click")
+local nativePress = rawget(getfenv(0), "keypress")
+local nativeRelease = rawget(getfenv(0), "keyrelease")
+
 local rawGetConnections = rawget(getfenv(0), "getconnections")
 
 local function safeGetConnections(signal)
@@ -208,6 +217,16 @@ local statusLabel, ball, doPanic
 -- 4. 输入模拟
 --------------------------------------------------------------
 local function pressKey(k, holdSec)
+    -- 执行器原生 keypress 优先，其次 VirtualInputManager
+    if nativePress and IS_PC then
+        local name = k.Name
+        if pcall(nativePress, name) then
+            task.delay(holdSec or 0.06, function()
+                if nativeRelease then pcall(nativeRelease, name) end
+            end)
+            return
+        end
+    end
     pcall(function()
         VirtualInputManager:SendKeyEvent(true, k, false, game)
     end)
@@ -222,11 +241,18 @@ local function clickCenter()
     local cam = Workspace.CurrentCamera
     if not cam then return end
     local vp = cam.ViewportSize
+
+    -- PC：原生 mouse1click 最稳
+    if IS_PC and nativeClick then
+        if pcall(nativeClick) then return end
+    end
+
     -- 点击位置做 ±8% 抖动，避免每次都是固定点
+    -- PC 上取偏上区域（40%），避开底部的血条/快捷栏 UI
     local jx = (math.random() - 0.5) * 0.16
     local jy = (math.random() - 0.5) * 0.16
     local x = vp.X * (0.5 + jx)
-    local y = vp.Y * (0.5 + jy)
+    local y = vp.Y * ((IS_PC and 0.42 or 0.5) + jy)
     pcall(function()
         VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
     end)
@@ -268,52 +294,107 @@ end
 
 local function fireButton(btn)
     if not btn or not btn.Parent then return false end
+    -- 路径 1：直接调用按钮上的连接函数（最精确）
     for _, sig in ipairs({ btn.MouseButton1Click, btn.MouseButton1Down, btn.Activated }) do
         local conns = safeGetConnections(sig)
         if conns then
             for _, c in ipairs(conns) do
                 local f = c.Function or c.func or c[1]
                 if type(f) == "function" then
-                    if pcall(f) then return true end
+                    pcall(f)
                 end
             end
         end
     end
+    -- 路径 2：无条件补一次真实坐标点击（移动端触摸通道）
+    -- 有些游戏的连接函数只做视觉反馈，真正逻辑挂在内部触摸处理上，必须两个都打
     local pos = btn.AbsolutePosition + btn.AbsoluteSize * 0.5
     pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
     end)
-    task.delay(0.04, function()
+    task.delay(0.05, function()
         pcall(function()
-            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
         end)
     end)
     return true
 end
 
-local KEY_BLOCK  = { "block", "guard", "parry", "defend", "counter", "格挡" }
-local KEY_ATTACK = { "m1", "attack", "punch", "light", "jab", "hit", "拳" }
-local KEY_DODGE  = { "dodge", "dash", "roll", "evade", "闪", "翻滚" }
+local KEY_BLOCK  = { "block", "guard", "parry", "defend", "counter", "格挡", "防御", "挡", "招架" }
+local KEY_ATTACK = { "m1", "attack", "punch", "light", "jab", "hit", "拳", "攻击", "打", "普攻", "轻击" }
+local KEY_DODGE  = { "dodge", "dash", "roll", "evade", "闪", "翻滚", "闪避", "躲避" }
+
+-- 兜底：名字对不上时，按屏幕位置盲选右下角的按钮
+local NOT_BATTLE = { "close", "exit", "setting", "menu", "chat", "shop", "back", "leave",
+                     "quit", "invite", "friend", "report", "关闭", "设置", "聊天", "商店", "退出" }
+local fallbackCache, fallbackTime = nil, 0
+
+local function findFallbackButtons()
+    local now = os.clock()
+    if fallbackCache and now - fallbackTime < 2 then
+        local alive = {}
+        for _, b in ipairs(fallbackCache) do
+            if b and b.Parent and b.Visible then table.insert(alive, b) end
+        end
+        if #alive > 0 then return alive end
+    end
+
+    local out = {}
+    local pg = LP:FindFirstChild("PlayerGui")
+    local cam = Workspace.CurrentCamera
+    if not (pg and cam) then return out end
+    local vp = cam.ViewportSize
+
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("GuiButton") and d.Visible then
+            local p, s = d.AbsolutePosition, d.AbsoluteSize
+            if p.X > vp.X * 0.55 and p.Y > vp.Y * 0.45 and s.Magnitude > 24 then
+                if not hasAny(string.lower(d.Name), NOT_BATTLE) then
+                    table.insert(out, d)
+                end
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        return a.AbsolutePosition.X + a.AbsolutePosition.Y > b.AbsolutePosition.X + b.AbsolutePosition.Y
+    end)
+    fallbackCache = out
+    fallbackTime = now
+    return out
+end
 
 local function actionBlock()
-    local btns = findButtons(KEY_BLOCK, 2, true)
-    if #btns > 0 then
-        fireButton(btns[1])
+    if IS_PC then
+        -- PC：游戏读的是键盘 F，直接按，按钮只做补充
+        pressKey(Enum.KeyCode.F)
+        local btns = findButtons(KEY_BLOCK, 1, true)
+        if #btns > 0 then fireButton(btns[1]) end
         return true
     end
+    -- 手机：按钮优先，再兜位置，最后按 F
+    local btns = findButtons(KEY_BLOCK, 2, true)
+    if #btns == 0 then btns = findFallbackButtons() end
+    if #btns > 0 then fireButton(btns[1]) end
     pressKey(Enum.KeyCode.F)
-    return false
+    return #btns > 0
 end
 
 local function actionDodge()
-    local btns = findButtons(KEY_DODGE, 2, true)
-    if #btns > 0 then
-        fireButton(btns[1])
+    if IS_PC then
+        pressKey(Enum.KeyCode.Q)
+        local btns = findButtons(KEY_DODGE, 1, true)
+        if #btns > 0 then fireButton(btns[1]) end
         return true
     end
+    local btns = findButtons(KEY_DODGE, 2, true)
+    if #btns == 0 then btns = findFallbackButtons() end
+    if #btns > 0 then fireButton(btns[1]) end
     pressKey(Enum.KeyCode.Q)
-    return false
+    return #btns > 0
 end
+
+-- 运行计数（面板底部显示，用来判断到底有没有打出去）
+local STAT = { atk = 0, def = 0, btnHit = 0, lastErr = "" }
 
 --------------------------------------------------------------
 -- 5. 移动
@@ -794,10 +875,12 @@ local function updateDefense()
 
         if kind == "heavy" then
             if CFG.defMode == "只格挡" then actionBlock() else actionDodge() end
+            STAT.def = STAT.def + 1
             defState.lastAction = now
             return
         elseif kind == "light" then
             if CFG.defMode == "只闪避" then actionDodge() else actionBlock() end
+            STAT.def = STAT.def + 1
             defState.lastAction = now
             return
         end
@@ -807,6 +890,7 @@ local function updateDefense()
             local toMe = me.Position - e.root.Position
             if toMe.Magnitude > 0.1 and look:Dot(toMe.Unit) > 0.35 then
                 if CFG.defMode == "只闪避" then actionDodge() else actionBlock() end
+                STAT.def = STAT.def + 1
                 defState.lastAction = now
                 return
             end
@@ -846,17 +930,42 @@ local function doAttack()
     if CFG.watched then gap = gap * 1.6 end          -- 有人看着就慢下来
     if now - atkState.last < gap then return end
     atkState.last = now
+    STAT.atk = STAT.atk + 1
 
     if CFG.atkMode == "鼠标" then
         clickCenter()
     elseif CFG.atkMode == "Remote" then
-        fireRemoteAttack()
+        if not fireRemoteAttack() then
+            local btns = findButtons(KEY_ATTACK, 2, true)
+            if #btns == 0 then btns = findFallbackButtons() end
+            if #btns > 0 then fireButton(btns[1]) else clickCenter() end
+        end
     elseif CFG.atkMode == "按钮" then
         local btns = findButtons(KEY_ATTACK, 2, true)
-        if #btns > 0 then fireButton(btns[1]) end
+        if #btns == 0 then btns = findFallbackButtons() end
+        if #btns > 0 then
+            fireButton(btns[1])
+            STAT.btnHit = STAT.btnHit + 1
+        end
     else
-        local btns = findButtons(KEY_ATTACK, 2, true)
-        if #btns > 0 then fireButton(btns[1]) else clickCenter() end
+        -- 自动：PC 用鼠标左键（游戏本来就是左键出拳），手机找屏幕按钮
+        if IS_PC then
+            clickCenter()
+            local btns = findButtons(KEY_ATTACK, 1, true)
+            if #btns > 0 then
+                fireButton(btns[1])
+                STAT.btnHit = STAT.btnHit + 1
+            end
+        else
+            local btns = findButtons(KEY_ATTACK, 2, true)
+            if #btns == 0 then btns = findFallbackButtons() end
+            if #btns > 0 then
+                fireButton(btns[1])
+                STAT.btnHit = STAT.btnHit + 1
+            else
+                clickCenter()
+            end
+        end
     end
 end
 
@@ -1089,8 +1198,14 @@ local overlay = new("Frame", {
     ZIndex = 1,
 }, gui)
 
+-- 面板尺寸：PC 上锁死 560×780（不然 92% 宽会横跨整个 2K 屏），手机按比例铺满
+local CAM0 = Workspace.CurrentCamera
+local VP0 = (CAM0 and CAM0.ViewportSize) or Vector2.new(1280, 720)
+local PANEL_W = math.min(IS_PC and 560 or VP0.X * 0.92, VP0.X * 0.95)
+local PANEL_H = math.min(IS_PC and 780 or VP0.Y * 0.84, VP0.Y * 0.92)
+
 local panel = new("Frame", {
-    Size = UDim2.new(0.92, 0, 0.84, 0),
+    Size = UDim2.fromOffset(PANEL_W, PANEL_H),
     Position = UDim2.fromScale(0.5, 0.5),
     AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundColor3 = C.glass,
@@ -1811,8 +1926,8 @@ local function openPanel()
     overlay.Visible = true
     panel.Visible = true
     if ball then ball.Visible = false end
-    panel.Size = UDim2.new(0.86, 0, 0.78, 0)
-    tween(panel, 0.2, { Size = UDim2.new(0.92, 0, 0.84, 0) })
+    panel.Size = UDim2.fromOffset(PANEL_W * 0.94, PANEL_H * 0.94)
+    tween(panel, 0.2, { Size = UDim2.fromOffset(PANEL_W, PANEL_H) })
 end
 
 local function closePanel()
@@ -1840,6 +1955,16 @@ doPanic = function()
     for _, r in ipairs(selectorRefreshers) do pcall(r) end
     closePanel()
     statusLabel.Text = "PANIC：已全部关闭并还原"
+end
+
+-- PC 快捷键：右 Shift 开关面板
+if IS_PC then
+    UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if input.KeyCode == Enum.KeyCode.RightShift then
+            if panel.Visible then closePanel() else openPanel() end
+        end
+    end)
 end
 
 closeBtn.MouseButton1Click:Connect(closePanel)
@@ -1927,14 +2052,18 @@ end)
 --------------------------------------------------------------
 RunService.RenderStepped:Connect(function()
     if CFG.combat ~= "OFF" then
-        pcall(updateCombat)
+        local ok, err = pcall(updateCombat)
+        if not ok then STAT.lastErr = "战斗:" .. tostring(err) end
     end
 end)
 
 task.spawn(function()
     while true do
         task.wait(0.05)
-        if CFG.defense then pcall(updateDefense) end
+        if CFG.defense then
+            local ok, err = pcall(updateDefense)
+            if not ok then STAT.lastErr = "防御:" .. tostring(err) end
+        end
     end
 end)
 
@@ -1970,11 +2099,20 @@ task.spawn(function()
         local active = #parts > 0 and table.concat(parts, "·") or "待机"
         local warn = ""
         if CFG.watched then
-            warn = string.format("  ⚠%d人注视", CFG.watchers)
+            warn = string.format(" ⚠%d", CFG.watchers)
         end
-        statusLabel.Text = string.format("%s | HP%d | %s%s",
-            active, hum and math.floor(hum.Health) or 0, CFG.profile, warn)
-        statusLabel.TextColor3 = CFG.watched and C.warn or C.dim
+        -- 调试计数：攻=发起攻击次数 防=触发防御次数 键=匹配到的攻击按钮数
+        local btnN = #findButtons(KEY_ATTACK, 4, true)
+        if STAT.lastErr ~= "" then
+            statusLabel.Text = "ERR " .. STAT.lastErr
+            statusLabel.TextColor3 = C.danger
+        else
+            statusLabel.Text = string.format("%s | HP%d | 攻%d 防%d 键%d | %s%s",
+                active, hum and math.floor(hum.Health) or 0,
+                STAT.atk, STAT.def, btnN,
+                IS_PC and "PC" or "手机", warn)
+            statusLabel.TextColor3 = CFG.watched and C.warn or C.dim
+        end
     end
 end)
 
